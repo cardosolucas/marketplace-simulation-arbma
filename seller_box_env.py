@@ -15,7 +15,7 @@ import torch.nn as nn
 
 import random
 import itertools
-from agents import FairAgentOptimizer, LinearAgent, ModelAgent, OptimizerAgent, FairPostProcessorAgent, AdversarialMitigationModel
+from agents import FairAgentOptimizer, LinearAgent, ModelAgent, OptimizerAgent, FairPostProcessorAgent, AdversarialMitigationModel, FeldmanAgent
 from collections import Counter
 
 MAX_VAL = 1e10
@@ -53,9 +53,9 @@ class SellerBoxEnv(MultiAgentEnv):
 
         # TEMPORARY: Uncomment the fair method desired
 
-        #self.fair_agent = FairPostProcessorAgent() # FA*IR
-        #self.fair_agent = FairAgentOptimizer() # Yang and Stoyanovich
-        self.fair_agent = config['adv_model'] # ARBMA
+        #self.fair_agent = FeldmanAgent() # Feldman et al.
+        self.fair_agent = FairAgentOptimizer() # Yang and Stoyanovich
+        #self.fair_agent = config['adv_model'] # ARBMA
 
         self.action_space = Dict({
             'offer': Discrete(self.action_gradients ** self.num_actions),

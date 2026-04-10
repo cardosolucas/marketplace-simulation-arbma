@@ -5,7 +5,7 @@ import os
 import numpy
 import pandas as pd
 import numpy as np
-from scipy.stats import rankdata, binom
+from scipy.stats import rankdata, binom, percentileofscore
 import optimization
 import scipy.optimize as optim
 from model import OptimizationModel, PredictorNetwork
@@ -121,6 +121,38 @@ class FairPostProcessorAgent:
             result_df = result_df.sort_values('initial_index').drop(columns=['initial_index'])
         
         return result_df
+
+class FeldmanAgent(Agent):
+    def __init__(self, protected_feature: str = 'premium'):
+        self.protected_feature = protected_feature
+
+    def rank(self, data: pd.DataFrame) -> pd.DataFrame:
+        df = data.copy()
+        
+        prot_mask = df[self.protected_feature] == True
+        unprot_mask = df[self.protected_feature] == False
+        
+        prot_scores = df.loc[prot_mask, 'scores'].values
+        unprot_scores = df.loc[unprot_mask, 'scores'].values
+        
+        fair_scores = df['scores'].copy()
+        
+        # Garante que existem membros em ambos os grupos antes de calcular os percentis
+        if len(prot_scores) > 0 and len(unprot_scores) > 0:
+            for idx in df[prot_mask].index:
+                orig_score = df.loc[idx, 'scores']
+                # Descobre o percentil do candidato protegido dentro do seu próprio grupo
+                p = percentileofscore(prot_scores, orig_score)
+                # Pega a qualificação correspondente ao mesmo percentil no grupo não protegido
+                new_score = np.percentile(unprot_scores, p)
+                fair_scores[idx] = new_score
+                
+        df['fair_scores'] = fair_scores.tolist()
+        
+        rank_list = rankdata(fair_scores, method='ordinal')
+        df['fair_rank'] = rank_list.tolist()
+        
+        return df
 
 class ModelAgent(Agent):
     def __init__(self, weigths: list):
@@ -295,7 +327,7 @@ class FairAgentOptimizer(Agent):
         pro_data = prep_data[pro_index, :]
         unpro_data = prep_data[unpro_index, :]
         _accmeasure = "scoreDiff"
-        _k = 4
+        _k = 14
 
         start_time = time.time()
         print("Starting optimization @ ", _k, "ACCM ", _accmeasure, " time: ", start_time)

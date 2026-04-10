@@ -1,0 +1,225 @@
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+
+# --- Dataset ---
+
+class CompasCategoricalDataset(Dataset):
+    def __init__(self, csv_path='datasets_arbma/compas-scores-two-years-violent.csv', val_split=0.1, seq_len=14):
+        super(CompasCategoricalDataset, self).__init__()
+        
+        # 1. Load and Filter
+        df = pd.read_csv(csv_path, header=0)
+        cols = ['sex', 'race', 'c_charge_degree', 'decile_score', 'age_cat',
+                'juv_fel_count', 'juv_misd_count', 'juv_other_count', 'priors_count']
+        df = df[cols]
+        df = df[df['race'].isin(['Caucasian', 'African-American'])].copy()
+        
+        # 3. Encoding
+        df['sex'] = df['sex'].map({'Male': 0, 'Female': 1})
+        df['race'] = df['race'].map({'Caucasian': 0, 'African-American': 1})
+        
+        cols_to_encode = ['c_charge_degree', 'age_cat']
+        df = pd.get_dummies(df, columns=cols_to_encode, dtype=int)
+        df = df.dropna()
+        
+        # 4. Shuffle and Group
+        df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        
+        target_col = 'decile_score'
+        sens_col = 'race'
+        
+        feature_cols = [c for c in df.columns if c not in [target_col, sens_col]]
+        self.num_features = len(feature_cols) + 1 # +1 for the mask column
+        
+        num_groups = len(df) // seq_len
+        df = df.iloc[:num_groups * seq_len].copy()
+        
+        # Target is now exactly 0 to 9 for CrossEntropy classification
+        X = df[feature_cols].values.astype(np.float32)
+        y = (df[target_col].values.astype(np.int64) - 1) 
+        sens = df[sens_col].values.astype(np.float32)
+        
+        mask = np.ones((len(X), 1), dtype=np.float32)
+        X = np.hstack((X, mask))
+        
+        self.inputs = X.reshape(num_groups, seq_len, self.num_features)
+        self.targets = y.reshape(num_groups, seq_len)
+        self.sensitive_attributes = sens.reshape(num_groups, seq_len)
+        
+        # Train/Val Split
+        self.dataset_size = len(self.inputs)
+        indices = torch.randperm(self.dataset_size).tolist()
+        val_size = int(self.dataset_size * val_split)
+        self.train_indices = indices[val_size:]
+        self.val_indices = indices[:val_size]
+
+    def __len__(self): return len(self.inputs)
+    
+    def __getitem__(self, idx):
+        # Targets are cast to torch.long because CrossEntropyLoss requires it
+        return (torch.tensor(self.inputs[idx]), 
+                torch.tensor(self.targets[idx], dtype=torch.long), 
+                torch.tensor(self.sensitive_attributes[idx]))
+
+# --- Networks ---
+
+class PredictorClassificationNetwork(nn.Module):
+    def __init__(self, input_shape, hidden_sizes, seq_len=14, num_classes=10):
+        super(PredictorClassificationNetwork, self).__init__()
+        input_size = input_shape[0] * input_shape[1]
+        self.seq_len = seq_len
+        self.num_classes = num_classes
+        
+        layers = []
+        prev_size = input_size
+        for size in hidden_sizes:
+            layers.append(nn.Linear(prev_size, size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.3))
+            prev_size = size
+            
+        # Output is Sequence Length * Number of Classes (14 * 10 = 140)
+        layers.append(nn.Linear(prev_size, seq_len * num_classes))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1)
+        out = self.model(x)
+        # Reshape to (Batch_size, Num_Classes, Sequence_Length)
+        # This exact shape is required by PyTorch's CrossEntropyLoss
+        return out.view(-1, self.num_classes, self.seq_len)
+
+class AdversaryClassificationNetwork(nn.Module):
+    def __init__(self, input_shape, hidden_sizes, output_size=14):
+        super(AdversaryClassificationNetwork, self).__init__()
+        # input_shape[1] now includes the 10 class probabilities instead of 1 score
+        input_size = input_shape[0] * input_shape[1] 
+        layers = []
+        prev_size = input_size
+        for size in hidden_sizes:
+            layers.append(nn.Linear(prev_size, size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.3))
+            prev_size = size
+        layers.append(nn.Linear(prev_size, output_size))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x, prediction_probs):
+        # prediction_probs comes in as (Batch, SeqLen, NumClasses)
+        combined_input = torch.cat([x, prediction_probs], dim=2)
+        combined_input = combined_input.flatten(start_dim=1)
+        return self.model(combined_input)
+
+# --- Training Loop ---
+
+def train_adversarial_model(model_pred, model_adv, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs):
+    tiny = 1e-8
+    model_pred.to(device); model_adv.to(device)
+    
+    # Changed to CrossEntropy for Multi-class
+    criterion_main = nn.CrossEntropyLoss(reduction='none') 
+    criterion_adv = nn.BCEWithLogitsLoss(reduction='none')
+
+    for epoch in range(epochs):
+        model_pred.train(); model_adv.train()
+        
+        running_p_loss = 0.0
+        running_a_loss = 0.0
+        
+        for inputs, targets, sens in train_dl:
+            inputs, targets, sens = inputs.to(device), targets.to(device), sens.to(device)
+            mask = inputs[:, :, -1]
+            # Train Adversary
+            opt_a.zero_grad()
+            p_out = model_pred(inputs).detach() 
+            
+            # Convert logits to probabilities and transpose to (Batch, SeqLen, NumClasses) for adversary
+            p_probs = torch.softmax(p_out, dim=1).transpose(1, 2)
+            
+            a_out = model_adv(inputs, p_probs)
+            a_loss = (criterion_adv(a_out, sens) * mask).sum() / mask.sum()
+            a_loss.backward()
+            opt_a.step()
+            # Train Predictor
+            opt_p.zero_grad()
+            p_out = model_pred(inputs)
+            p_probs = torch.softmax(p_out, dim=1).transpose(1, 2)
+            a_out = model_adv(inputs, p_probs)
+            
+            p_loss_val = (criterion_main(p_out, targets) * mask).sum() / mask.sum()
+            a_loss_val = (criterion_adv(a_out, sens) * mask).sum() / mask.sum()
+            dW_LP = torch.autograd.grad(p_loss_val, model_pred.parameters(), retain_graph=True)
+            dW_LA = torch.autograd.grad(a_loss_val, model_pred.parameters())
+            for i, p in enumerate(model_pred.parameters()):
+                unit_dW_LA = dW_LA[i] / (torch.norm(dW_LA[i]) + tiny)
+                proj = torch.sum(dW_LP[i] * unit_dW_LA)
+                p.grad = dW_LP[i] - (proj * unit_dW_LA) - (alpha * dW_LA[i])
+            torch.nn.utils.clip_grad_norm_(model_pred.parameters(), max_norm=1.0)
+            opt_p.step()
+            running_p_loss += p_loss_val.item()
+            running_a_loss += a_loss_val.item()
+        avg_p = running_p_loss / len(train_dl)
+        avg_a = running_a_loss / len(train_dl)
+        
+        print(f"Epoch [{epoch+1:03d}/{epochs}] | Pred Loss: {avg_p:.6f} | Adv BCE: {avg_a:.6f}")
+        if (epoch + 1) % 10 == 0:
+            validate(model_pred, val_dl, device, criterion_main)
+                
+    torch.save(model_pred, 'adversarial_categorical_predictor.pth')
+    print("Model saved as 'adversarial_categorical_predictor.pth'")
+
+def validate(model_pred, val_dl, device, criterion_main):
+    model_pred.eval()
+    val_p_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, targets, _ in val_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+            mask = inputs[:, :, -1]
+            out = model_pred(inputs)
+            loss = (criterion_main(out, targets) * mask).sum() / mask.sum()
+            val_p_loss += loss.item()
+            
+            predictions = torch.argmax(out, dim=1)
+            correct += ((predictions == targets) * mask).sum().item()
+            total += mask.sum().item()
+            
+    acc = (correct / total) * 100 if total > 0 else 0
+    print(f"    >>> Validation Loss: {val_p_loss / len(val_dl):.6f} | Accuracy: {acc:.2f}%")
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    dataset = CompasCategoricalDataset(val_split=0.2)
+    train_ds = torch.utils.data.Subset(dataset, dataset.train_indices)
+    val_ds = torch.utils.data.Subset(dataset, dataset.val_indices)
+    
+    train_dl = DataLoader(train_ds, batch_size=32, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=32)
+
+    seq_len = 14
+    num_classes = 10
+    num_features = dataset.num_features 
+    
+    input_dim_predictor = (seq_len, num_features)
+    # Adversary input now includes the 10 distinct probabilities generated by the predictor
+    input_dim_adversary = (seq_len, num_features + num_classes) 
+    
+    predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], seq_len=seq_len, num_classes=num_classes)
+    adversary = AdversaryClassificationNetwork(input_dim_adversary, [48], output_size=seq_len)
+
+    opt_p = optim.Adam(predictor.parameters(), lr=0.0046)
+    opt_a = optim.Adam(adversary.parameters(), lr=0.0046)
+
+    alpha = 1 # Bias mitigation strength
+    train_adversarial_model(predictor, adversary, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs=100)
+
+if __name__ == "__main__":
+    main()
