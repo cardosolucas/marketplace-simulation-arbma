@@ -5,12 +5,11 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# --- 1. Network Definition (Required to load the model) ---
+# --- 1. Network Definition (Updated for Single Instance) ---
+# This must exactly match the architecture of the saved model
 class PredictorClassificationNetwork(nn.Module):
-    def __init__(self, input_shape, hidden_sizes, seq_len=14, num_classes=10):
+    def __init__(self, input_size, hidden_sizes, num_classes=10):
         super(PredictorClassificationNetwork, self).__init__()
-        input_size = input_shape[0] * input_shape[1]
-        self.seq_len = seq_len
         self.num_classes = num_classes
         
         layers = []
@@ -21,20 +20,17 @@ class PredictorClassificationNetwork(nn.Module):
             layers.append(nn.Dropout(0.3))
             prev_size = size
             
-        layers.append(nn.Linear(prev_size, seq_len * num_classes))
+        layers.append(nn.Linear(prev_size, num_classes))
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.flatten(start_dim=1)
-        out = self.model(x)
-        return out.view(-1, self.num_classes, self.seq_len)
+        return self.model(x)
 
 def main():
     # --- 2. Load and Preprocess the Data ---
     print("Loading and formatting dataset...")
     df = pd.read_csv('datasets_arbma/compas-scores-two-years-violent.csv', header=0)
     
-    # FIXED: Added 'is_violent_recid' back to the columns list to use as ground truth
     cols = ['sex', 'race', 'c_charge_degree', 'decile_score', 'age_cat',
             'juv_fel_count', 'juv_misd_count', 'juv_other_count', 'priors_count', 'is_violent_recid']
     df = df[cols]
@@ -55,34 +51,30 @@ def main():
     df = pd.get_dummies(df, columns=cols_to_encode, dtype=int)
     df = df.dropna()
 
-    # --- 3. Format Data for the Model ---
-    seq_len = 14
-    num_groups = len(df) // seq_len
-    df_eval = df.iloc[:num_groups * seq_len].copy() 
+    # --- 3. Format Data for the Model (Single Instance) ---
+    df_eval = df.copy() 
     
-    # FIXED: Added 'is_violent_recid' to exclude_cols so the model doesn't cheat!
     exclude_cols = ['decile_score', 'race', 'Race_Label', 'Original_Decile', 'is_violent_recid']
     feature_cols = [c for c in df_eval.columns if c not in exclude_cols]
     
     X = df_eval[feature_cols].values.astype(np.float32)
-    mask = np.ones((len(X), 1), dtype=np.float32)
-    X = np.hstack((X, mask))
     
-    num_features = X.shape[1]
-    X_tensor = torch.tensor(X.reshape(num_groups, seq_len, num_features))
+    # Direct tensor conversion, no sequence reshaping or masks needed
+    X_tensor = torch.tensor(X)
 
     # --- 4. Run Inference ---
     print("Loading model and generating predictions...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     X_tensor = X_tensor.to(device)
     
-    model = torch.load('best_arbma_categorical_predictor.pth', map_location=device)
+    # Load the trained single-instance model
+    model = torch.load('best_adversarial_categorical_predictor.pth', map_location=device)
     model.eval()
     
     with torch.no_grad():
         out = model(X_tensor) 
         preds = torch.argmax(out, dim=1) 
-        preds_1_to_10 = preds.flatten().cpu().numpy() + 1
+        preds_1_to_10 = preds.cpu().numpy() + 1 # Convert back to 1-10 decile range
         
     df_eval['Predicted_Decile'] = preds_1_to_10
 

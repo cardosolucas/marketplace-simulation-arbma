@@ -21,3 +21,4 @@ share/python-wheels/
 *.egg
 MANIFEST
 data/
+data_baseline/

@@ -12,6 +12,7 @@ from model import OptimizationModel, PredictorNetwork
 import joblib
 import random
 import torch
+import cloudpickle
 import math
 import lightgbm as lgb
 from sklearn.preprocessing import MinMaxScaler
@@ -27,100 +28,6 @@ class Agent(ABC):
 
     def rank(self, data: pd.DataFrame) -> pd.DataFrame:
         pass
-
-class DeltrAgent(Agent):
-    def __init__(self, model_path=None, protected_feature="premium"):
-        self.protected_feature = protected_feature
-        self.model = joblib.load(model_path)
-        self.weights = self.model._omega
-
-    def rank(self, data: pd.DataFrame) -> pd.DataFrame:
-        data[self.protected_feature] = data[self.protected_feature].astype(float)
-        features = data[[self.protected_feature, 'scores']].to_numpy()
-        fair_scores = np.dot(features, self.weights)
-
-        ranking_reference = list(reversed(range(1, len(fair_scores) + 1)))
-        rank_list = rankdata(fair_scores, method='ordinal')
-        reversed_rank_list = [ranking_reference[rank - 1] for rank in rank_list]
-        data['fair_scores'] = fair_scores.tolist()
-        data['fair_rank'] = reversed_rank_list
-        del(features)
-        return data
-
-class FairPostProcessorAgent:
-    def __init__(self, protected_feature: str = 'premium', p: float = 0.3, alpha: float = 0.1):
-        self.protected_feature = protected_feature
-        self.p = p
-        self.alpha = alpha
-        self._cache_m = {}
-
-    def _get_min_protected(self, k: int) -> int:
-        
-        if k in self._cache_m: return self._cache_m[k]
-    
-        for m in range(k + 1):
-            if binom.cdf(m - 1, k, self.p) >= self.alpha:
-                val = max(0, m - 1)
-                self._cache_m[k] = val
-                return val
-        return k
-
-    def rank(self, data: pd.DataFrame) -> pd.DataFrame:
-        df = data.copy()
-        df['initial_index'] = range(len(df))
-        n_total = len(df)
-        
-        sorted_original_scores = df['scores'].sort_values(ascending=False).values
-
-        protected = df[df[self.protected_feature] == True].sort_values('scores', ascending=False).to_dict('records')
-        non_protected = df[df[self.protected_feature] == False].sort_values('scores', ascending=False).to_dict('records')
-        
-        fair_ordered_list = []
-        p_ptr, np_ptr = 0, 0
-        
-        for k in range(1, n_total + 1):
-            min_m = self._get_min_protected(k)
-            
-            current_p_count = sum(1 for x in fair_ordered_list if x[self.protected_feature])
-            
-            force_protected = current_p_count < min_m
-            
-            p_available = p_ptr < len(protected)
-            np_available = np_ptr < len(non_protected)
-            
-            pick_protected = False
-            
-            if force_protected and p_available:
-                pick_protected = True
-            elif not p_available:
-                pick_protected = False
-            elif not np_available:
-                pick_protected = True
-            else:
-                p_score = protected[p_ptr]['scores']
-                np_score = non_protected[np_ptr]['scores']
-                if p_score >= np_score:
-                    pick_protected = True
-                else:
-                    pick_protected = False
-
-            if pick_protected:
-                fair_ordered_list.append(protected[p_ptr])
-                p_ptr += 1
-            else:
-                fair_ordered_list.append(non_protected[np_ptr])
-                np_ptr += 1
-        
-        for i, item in enumerate(fair_ordered_list):
-            item['fair_scores'] = sorted_original_scores[i]
-            item['fair_rank'] = n_total - i
-
-        result_df = pd.DataFrame(fair_ordered_list)
-        
-        if not result_df.empty:
-            result_df = result_df.sort_values('initial_index').drop(columns=['initial_index'])
-        
-        return result_df
 
 class FeldmanAgent(Agent):
     def __init__(self, protected_feature: str = 'premium'):
@@ -153,83 +60,6 @@ class FeldmanAgent(Agent):
         df['fair_rank'] = rank_list.tolist()
         
         return df
-
-class ModelAgent(Agent):
-    def __init__(self, weigths: list):
-        self.ranker = lgb.Booster(
-            model_file=os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'notebooks',
-                'lgbm_ranker_fair.txt'
-            )
-        )
-        self.weigths = weigths
-
-    def rank(self, data: pd.DataFrame) -> pd.DataFrame:
-        scores_baseline = []
-        for i in range(len(data.index)):
-            row = data.loc[i, :].values.flatten().tolist()
-            #row = row[:-1]
-            assert len(self.weigths) == len(row)
-            score = 0
-            score_baseline = 0
-            for idx in range(len(row)):
-                score += self.weigths[idx] * float(row[idx])
-                if idx < len(row) - 1:
-                    score_baseline += self.weigths[idx] * float(row[idx])
-            scores_baseline.append(score_baseline)
-        scores = self.ranker.predict(data)
-        ranking_reference = list(reversed(range(1, len(scores) + 1)))
-        rank_list = rankdata(scores, method='ordinal')
-        rank_baseline_list = rankdata(scores_baseline, method='ordinal')
-        reversed_rank_list = []
-        reversed_rank_baseline_list = []
-        for i in range(len(scores)):
-            reversed_rank_list.append(ranking_reference[rank_list[i] - 1])
-            reversed_rank_baseline_list.append(ranking_reference[rank_baseline_list[i] - 1])
-        data['scores'] = scores
-        data['rank'] = reversed_rank_list
-        data['scores_baseline'] = scores_baseline
-        data['rank_baseline'] = reversed_rank_baseline_list
-        return data
-
-
-class LinearAgent(Agent):
-    def __init__(self, weigths: list):
-        self.weights = weigths
-
-    def rank(self, data: pd.DataFrame) -> pd.DataFrame:
-        scores = []
-        scores_baseline = []
-        for i in range(len(data.index)):
-            row = data.loc[i, :].values.flatten().tolist()
-            #row = row[:-1]
-            assert len(self.weights) == len(row)
-            score = 0
-            score_baseline = 0
-            for idx in range(len(row)):
-                if idx < len(row) - 1:
-                    score_baseline += self.weights[idx] * float(row[idx])
-                else:
-                    if random.random() < 0.3:
-                        score += self.weights[idx] * float(row[idx])
-                    continue
-                score += self.weights[idx] * float(row[idx])
-            scores.append(score)
-            scores_baseline.append(score_baseline)
-        ranking_reference = list(reversed(range(1, len(scores) + 1)))
-        rank_list = rankdata(scores, method='ordinal')
-        rank_baseline_list = rankdata(scores_baseline, method='ordinal')
-        reversed_rank_list = []
-        reversed_rank_baseline_list = []
-        for i in range(len(scores)):
-            reversed_rank_list.append(ranking_reference[rank_list[i] - 1])
-            reversed_rank_baseline_list.append(ranking_reference[rank_baseline_list[i] - 1])
-        data['scores'] = scores
-        data['rank'] = reversed_rank_list
-        data['scores_baseline'] = scores_baseline
-        data['rank_baseline'] = reversed_rank_baseline_list
-        return data
 
 class OptimizerAgent(Agent):
     def __init__(self,
@@ -391,4 +221,28 @@ class AdversarialMitigationModel:
         data['fair_scores'] = predictions
         data['fair_rank'] = rank_list
 
+        return data
+
+class FairlearnAdversarialAgent(Agent):
+    def __init__(self, model_path='fairlearn_adv_regressor.pkl', scaler_x_path='fairlearn_scaler_X.pkl', scaler_y_path='fairlearn_scaler_y.pkl'):
+        with open(model_path, 'rb') as f:
+            self.model = cloudpickle.load(f)
+        self.scaler_X = joblib.load(scaler_x_path)
+        self.scaler_y = joblib.load(scaler_y_path)
+
+    def rank(self, data: pd.DataFrame) -> pd.DataFrame:
+        feature_cols = ['price', 'installments', 'delivery_time']
+        features = data[feature_cols].copy()
+        
+        # Transform features based on the saved scaler
+        features_scaled = self.scaler_X.transform(features)
+        
+        predictions_scaled = self.model.predict(features_scaled)
+            
+        predictions = self.scaler_y.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+        
+        rank_list = rankdata(predictions, method='ordinal')
+        
+        data['fair_scores'] = predictions
+        data['fair_rank'] = rank_list
         return data

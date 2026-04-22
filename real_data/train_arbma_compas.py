@@ -4,6 +4,15 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
+import optuna
+from sklearn import metrics as skm
+
+from fairlearn.metrics import (
+    MetricFrame,
+    count,
+    selection_rate,
+    false_positive_rate
+)
 
 # --- Dataset ---
 
@@ -116,16 +125,18 @@ class AdversaryClassificationNetwork(nn.Module):
 
 # --- Training Loop ---
 
-def train_adversarial_model(model_pred, model_adv, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs):
+def train_adversarial_model(model_pred, model_adv, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs, verbose=True):
     tiny = 1e-8
-    model_pred.to(device); model_adv.to(device)
+    model_pred.to(device)
+    model_adv.to(device)
     
     # Changed to CrossEntropy for Multi-class
     criterion_main = nn.CrossEntropyLoss(reduction='none') 
     criterion_adv = nn.BCEWithLogitsLoss(reduction='none')
 
     for epoch in range(epochs):
-        model_pred.train(); model_adv.train()
+        model_pred.train()
+        model_adv.train()
         
         running_p_loss = 0.0
         running_a_loss = 0.0
@@ -133,6 +144,7 @@ def train_adversarial_model(model_pred, model_adv, train_dl, val_dl, opt_p, opt_
         for inputs, targets, sens in train_dl:
             inputs, targets, sens = inputs.to(device), targets.to(device), sens.to(device)
             mask = inputs[:, :, -1]
+            
             # Train Adversary
             opt_a.zero_grad()
             p_out = model_pred(inputs).detach() 
@@ -144,6 +156,7 @@ def train_adversarial_model(model_pred, model_adv, train_dl, val_dl, opt_p, opt_
             a_loss = (criterion_adv(a_out, sens) * mask).sum() / mask.sum()
             a_loss.backward()
             opt_a.step()
+            
             # Train Predictor
             opt_p.zero_grad()
             p_out = model_pred(inputs)
@@ -154,44 +167,113 @@ def train_adversarial_model(model_pred, model_adv, train_dl, val_dl, opt_p, opt_
             a_loss_val = (criterion_adv(a_out, sens) * mask).sum() / mask.sum()
             dW_LP = torch.autograd.grad(p_loss_val, model_pred.parameters(), retain_graph=True)
             dW_LA = torch.autograd.grad(a_loss_val, model_pred.parameters())
+            
             for i, p in enumerate(model_pred.parameters()):
                 unit_dW_LA = dW_LA[i] / (torch.norm(dW_LA[i]) + tiny)
                 proj = torch.sum(dW_LP[i] * unit_dW_LA)
                 p.grad = dW_LP[i] - (proj * unit_dW_LA) - (alpha * dW_LA[i])
+                
             torch.nn.utils.clip_grad_norm_(model_pred.parameters(), max_norm=1.0)
             opt_p.step()
+            
             running_p_loss += p_loss_val.item()
             running_a_loss += a_loss_val.item()
-        avg_p = running_p_loss / len(train_dl)
-        avg_a = running_a_loss / len(train_dl)
-        
-        print(f"Epoch [{epoch+1:03d}/{epochs}] | Pred Loss: {avg_p:.6f} | Adv BCE: {avg_a:.6f}")
-        if (epoch + 1) % 10 == 0:
-            validate(model_pred, val_dl, device, criterion_main)
+            
+        if verbose:
+            avg_p = running_p_loss / len(train_dl)
+            avg_a = running_a_loss / len(train_dl)
+            print(f"Epoch [{epoch+1:03d}/{epochs}] | Pred Loss: {avg_p:.6f} | Adv BCE: {avg_a:.6f}")
+            if (epoch + 1) % 10 == 0:
+                validate(model_pred, val_dl, device, criterion_main, verbose=True)
                 
-    torch.save(model_pred, 'adversarial_categorical_predictor.pth')
-    print("Model saved as 'adversarial_categorical_predictor.pth'")
+    return model_pred
 
-def validate(model_pred, val_dl, device, criterion_main):
+def validate(model_pred, val_dl, device, criterion_main, verbose=True):
     model_pred.eval()
     val_p_loss = 0.0
-    correct = 0
-    total = 0
+    
+    preds_list = []
+    targets_list = []
+    sens_list = []
+    mask_list = []
     
     with torch.no_grad():
-        for inputs, targets, _ in val_dl:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for inputs, targets, sens in val_dl:
+            inputs, targets, sens = inputs.to(device), targets.to(device), sens.to(device)
             mask = inputs[:, :, -1]
             out = model_pred(inputs)
+            
             loss = (criterion_main(out, targets) * mask).sum() / mask.sum()
             val_p_loss += loss.item()
             
             predictions = torch.argmax(out, dim=1)
-            correct += ((predictions == targets) * mask).sum().item()
-            total += mask.sum().item()
             
-    acc = (correct / total) * 100 if total > 0 else 0
-    print(f"    >>> Validation Loss: {val_p_loss / len(val_dl):.6f} | Accuracy: {acc:.2f}%")
+            preds_list.append(predictions.cpu())
+            targets_list.append(targets.cpu())
+            sens_list.append(sens.cpu())
+            mask_list.append(mask.cpu())
+            
+    # Flatten the sequences to evaluate overall fairness
+    preds_flat = torch.cat(preds_list).flatten().numpy()
+    targets_flat = torch.cat(targets_list).flatten().numpy()
+    sens_flat = torch.cat(sens_list).flatten().numpy()
+    mask_flat = torch.cat(mask_list).flatten().numpy()
+    
+    # Filter out masked paddings
+    valid_idx = mask_flat == 1.0
+    preds_valid = preds_flat[valid_idx]
+    targets_valid = targets_flat[valid_idx]
+    sens_valid = sens_flat[valid_idx]
+
+    acc = np.mean(preds_valid == targets_valid) * 100 if len(preds_valid) > 0 else 0
+
+    binary_metric_frame = MetricFrame(
+        metrics={
+            "false_positive_rate": false_positive_rate,
+            "selection_rate": selection_rate,
+            "count": count
+        },
+        sensitive_features=sens_valid,
+        y_true=np.where(targets_valid >= 5, 1, 0),
+        y_pred=np.where(preds_valid >= 5, 1, 0),
+    )
+
+    df_binary_metrics = binary_metric_frame.by_group
+    
+    # Fallback in case a batch is missing a demographic group during tuning
+    try:
+        fp_protected = df_binary_metrics[df_binary_metrics.index == 1].iloc[0]['false_positive_rate']
+    except IndexError: fp_protected = 0.0
+    
+    try:
+        fp_non_protected = df_binary_metrics[df_binary_metrics.index == 0].iloc[0]['false_positive_rate']
+    except IndexError: fp_non_protected = 0.0
+        
+    false_positive_diff = abs(fp_protected - fp_non_protected)
+
+    if verbose:
+        print(f"    >>> Validation Loss: {val_p_loss / len(val_dl):.6f} | Accuracy: {acc:.2f}% | FPR Diff: {false_positive_diff:.6f}")
+        
+    return false_positive_diff
+
+# --- Optuna Optimization ---
+
+def objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, seq_len, num_classes):
+    alpha = trial.suggest_float('alpha', 0.1, 100.0)
+    
+    predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], seq_len=seq_len, num_classes=num_classes)
+    adversary = AdversaryClassificationNetwork(input_dim_adversary, [48], output_size=seq_len)
+
+    opt_p = optim.Adam(predictor.parameters(), lr=0.0046)
+    opt_a = optim.Adam(adversary.parameters(), lr=0.0046)
+
+    predictor = train_adversarial_model(predictor, adversary, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs=40, verbose=False)
+    
+    criterion_main = nn.CrossEntropyLoss(reduction='none')
+    false_positive_diff = validate(predictor, val_dl, device, criterion_main, verbose=False)
+    
+    return false_positive_diff if false_positive_diff > 0 else float('inf')
+
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -209,17 +291,27 @@ def main():
     num_features = dataset.num_features 
     
     input_dim_predictor = (seq_len, num_features)
-    # Adversary input now includes the 10 distinct probabilities generated by the predictor
     input_dim_adversary = (seq_len, num_features + num_classes) 
     
-    predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], seq_len=seq_len, num_classes=num_classes)
-    adversary = AdversaryClassificationNetwork(input_dim_adversary, [48], output_size=seq_len)
+    #print("Starting Optuna Hyperparameter Optimization...")
+    #study = optuna.create_study(direction="minimize")
+    #study.optimize(lambda trial: objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, seq_len, num_classes), n_trials=500)
+    
+    #best_alpha = study.best_params['alpha']
+    #print(f"\n--- Optimization Complete ---")
+    #print(f"Best alpha found: {best_alpha:.4f} with FPR diff: {study.best_value:.4f}")
+    
+    #print(f"\nTraining final model with best alpha = {best_alpha:.4f} for 100 epochs...")
+    final_predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], seq_len=seq_len, num_classes=num_classes)
+    final_adversary = AdversaryClassificationNetwork(input_dim_adversary, [48], output_size=seq_len)
 
-    opt_p = optim.Adam(predictor.parameters(), lr=0.0046)
-    opt_a = optim.Adam(adversary.parameters(), lr=0.0046)
+    opt_p_final = optim.Adam(final_predictor.parameters(), lr=0.0046)
+    opt_a_final = optim.Adam(final_adversary.parameters(), lr=0.0046)
 
-    alpha = 1 # Bias mitigation strength
-    train_adversarial_model(predictor, adversary, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs=100)
+    final_predictor = train_adversarial_model(final_predictor, final_adversary, train_dl, val_dl, opt_p_final, opt_a_final, device, 40.5100, epochs=100, verbose=True)
+    
+    torch.save(final_predictor, 'best_arbma_categorical_predictor.pth')
+    print("Best model saved as 'best_arbma_categorical_predictor.pth'")
 
 if __name__ == "__main__":
     main()
