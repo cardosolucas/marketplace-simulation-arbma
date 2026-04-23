@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 import optuna
 from sklearn import metrics as skm
+import statistics
 
 from fairlearn.metrics import (
     MetricFrame,
@@ -227,39 +228,30 @@ def validate(model_pred, val_dl, device, criterion_main, verbose=True):
 
     acc = np.mean(preds_valid == targets_valid) * 100 if len(preds_valid) > 0 else 0
 
-    binary_metric_frame = MetricFrame(
+    metric_frame = MetricFrame(
         metrics={
-            "false_positive_rate": false_positive_rate,
-            "selection_rate": selection_rate,
+            "accuracy": skm.accuracy_score,
+            "f1": lambda y_true, y_pred: skm.f1_score(y_true, y_pred, average="macro"),
             "count": count
         },
         sensitive_features=sens_valid,
-        y_true=np.where(targets_valid >= 5, 1, 0),
-        y_pred=np.where(preds_valid >= 5, 1, 0),
+        y_true=targets_valid,
+        y_pred=preds_valid
     )
 
-    df_binary_metrics = binary_metric_frame.by_group
-    
-    # Fallback in case a batch is missing a demographic group during tuning
-    try:
-        fp_protected = df_binary_metrics[df_binary_metrics.index == 1].iloc[0]['false_positive_rate']
-    except IndexError: fp_protected = 0.0
-    
-    try:
-        fp_non_protected = df_binary_metrics[df_binary_metrics.index == 0].iloc[0]['false_positive_rate']
-    except IndexError: fp_non_protected = 0.0
-        
-    false_positive_diff = abs(fp_protected - fp_non_protected)
+    df_metrics = metric_frame.by_group
+    f1_protected = df_metrics[df_metrics.index == 1].iloc[0].tolist()[1]
+    f1_non_protected = df_metrics[df_metrics.index == 0].iloc[0].tolist()[1]
 
-    if verbose:
-        print(f"    >>> Validation Loss: {val_p_loss / len(val_dl):.6f} | Accuracy: {acc:.2f}% | FPR Diff: {false_positive_diff:.6f}")
-        
-    return false_positive_diff
+    optimization_metric = statistics.geometric_mean([f1_protected, f1_non_protected]) * -1
+
+    return optimization_metric
+
 
 # --- Optuna Optimization ---
 
 def objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, seq_len, num_classes):
-    alpha = trial.suggest_float('alpha', 0.1, 100.0)
+    alpha = trial.suggest_float('alpha', 0.001, 1)
     
     predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], seq_len=seq_len, num_classes=num_classes)
     adversary = AdversaryClassificationNetwork(input_dim_adversary, [48], output_size=seq_len)
@@ -267,12 +259,12 @@ def objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_ad
     opt_p = optim.Adam(predictor.parameters(), lr=0.0046)
     opt_a = optim.Adam(adversary.parameters(), lr=0.0046)
 
-    predictor = train_adversarial_model(predictor, adversary, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs=40, verbose=False)
+    predictor = train_adversarial_model(predictor, adversary, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs=100, verbose=False)
     
     criterion_main = nn.CrossEntropyLoss(reduction='none')
-    false_positive_diff = validate(predictor, val_dl, device, criterion_main, verbose=False)
+    optimization_metric = validate(predictor, val_dl, device, criterion_main, verbose=False)
     
-    return false_positive_diff if false_positive_diff > 0 else float('inf')
+    return optimization_metric  if optimization_metric < 0 else float('inf')
 
 
 def main():
@@ -293,22 +285,22 @@ def main():
     input_dim_predictor = (seq_len, num_features)
     input_dim_adversary = (seq_len, num_features + num_classes) 
     
-    #print("Starting Optuna Hyperparameter Optimization...")
-    #study = optuna.create_study(direction="minimize")
-    #study.optimize(lambda trial: objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, seq_len, num_classes), n_trials=500)
+    print("Starting Optuna Hyperparameter Optimization...")
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda trial: objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, seq_len, num_classes), n_trials=500)
     
-    #best_alpha = study.best_params['alpha']
-    #print(f"\n--- Optimization Complete ---")
-    #print(f"Best alpha found: {best_alpha:.4f} with FPR diff: {study.best_value:.4f}")
+    best_alpha = study.best_params['alpha']
+    print(f"\n--- Optimization Complete ---")
+    print(f"Best alpha found: {best_alpha:.4f} with FPR diff: {study.best_value:.4f}")
     
-    #print(f"\nTraining final model with best alpha = {best_alpha:.4f} for 100 epochs...")
+    print(f"\nTraining final model with best alpha = {best_alpha:.4f} for 100 epochs...")
     final_predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], seq_len=seq_len, num_classes=num_classes)
     final_adversary = AdversaryClassificationNetwork(input_dim_adversary, [48], output_size=seq_len)
 
     opt_p_final = optim.Adam(final_predictor.parameters(), lr=0.0046)
     opt_a_final = optim.Adam(final_adversary.parameters(), lr=0.0046)
 
-    final_predictor = train_adversarial_model(final_predictor, final_adversary, train_dl, val_dl, opt_p_final, opt_a_final, device, 40.5100, epochs=100, verbose=True)
+    final_predictor = train_adversarial_model(final_predictor, final_adversary, train_dl, val_dl, opt_p_final, opt_a_final, device, best_alpha, epochs=100, verbose=True)
     
     torch.save(final_predictor, 'best_arbma_categorical_predictor.pth')
     print("Best model saved as 'best_arbma_categorical_predictor.pth'")

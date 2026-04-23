@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn import metrics as skm
 import optuna
+import statistics
 
 from fairlearn.metrics import (
     MetricFrame,
@@ -14,7 +15,7 @@ from fairlearn.metrics import (
     plot_model_comparison,
     selection_rate,
     selection_rate_difference,
-    false_positive_rate_difference,
+    true_positive_rate,
     false_positive_rate
 )
 from fairlearn.reductions import DemographicParity, ErrorRate, GridSearch
@@ -210,22 +211,30 @@ def validate(model_pred, val_dl, device, criterion_main, verbose=True):
             metrics={
                 "accuracy": skm.accuracy_score,
                 "mean_prediction": mean_prediction,
-                "count": count,
+                "f1": lambda y_true, y_pred: skm.f1_score(y_true, y_pred, average="macro"),
+                "count": count
             },
             sensitive_features=sens_list.cpu().numpy(),
             y_true=targets_list.cpu().numpy(),
             y_pred=predictions_list.cpu().numpy(),
         )
 
+        df_metrics = metric_frame.by_group
+        f1_protected = df_metrics[df_metrics.index == 1].iloc[0].tolist()[2]
+        f1_non_protected = df_metrics[df_metrics.index == 0].iloc[0].tolist()[2]
+
+        optimization_metric = statistics.geometric_mean([f1_protected, f1_non_protected]) * -1
+        '''
         binary_metric_frame = MetricFrame(
             metrics={
                 "false_positive_rate": false_positive_rate,
+                "true_positive_rate": true_positive_rate,
                 "selection_rate": selection_rate,
                 "count": count
             },
             sensitive_features=sens_list.cpu().numpy(),
-            y_true=np.where(targets_list.cpu().numpy() >= 5, 1, 0),
-            y_pred=np.where(predictions_list.cpu().numpy() >= 5, 1, 0),
+            y_true=np.where(targets_list.cpu().numpy() >= 8, 1, 0),
+            y_pred=np.where(predictions_list.cpu().numpy() >= 8, 1, 0),
         )
         
         if verbose:
@@ -235,13 +244,19 @@ def validate(model_pred, val_dl, device, criterion_main, verbose=True):
         df_binary_metrics = binary_metric_frame.by_group
         false_positive_protected = df_binary_metrics[df_binary_metrics.index == 1].iloc[0].tolist()[0]
         false_positive_non_protected = df_binary_metrics[df_binary_metrics.index == 0].iloc[0].tolist()[0]
-        false_positive_diff = abs(false_positive_protected - false_positive_non_protected)
+        true_positive_protected = df_binary_metrics[df_binary_metrics.index == 1].iloc[0].tolist()[1]
+        true_positive_non_protected = df_binary_metrics[df_binary_metrics.index == 0].iloc[0].tolist()[1]
+        equalized_odds_diff = max(
+            abs(true_positive_protected - true_positive_non_protected),
+            abs(false_positive_protected - false_positive_non_protected)
+        )
+        '''
 
-        return metric_frame, binary_metric_frame, false_positive_diff
+        return metric_frame, optimization_metric
     
 def objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, num_classes):
     # Suggest an alpha between 0.1 and 1.0
-    alpha = trial.suggest_float('alpha', 0.1, 100.0)
+    alpha = trial.suggest_float('alpha', 0.001, 1.0)
     
     # Initialize fresh models for each trial
     predictor = PredictorClassificationNetwork(input_dim_predictor, [256, 48, 144], num_classes=num_classes)
@@ -255,9 +270,9 @@ def objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_ad
     predictor = train_adversarial_model(predictor, adversary, train_dl, val_dl, opt_p, opt_a, device, alpha, epochs=40, verbose=False)
     
     criterion_main = nn.CrossEntropyLoss()
-    _, _, false_positive_diff = validate(predictor, val_dl, device, criterion_main, verbose=False)
+    _, optimization_metric = validate(predictor, val_dl, device, criterion_main, verbose=False)
     
-    return false_positive_diff
+    return optimization_metric
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,7 +294,7 @@ def main():
     print("Starting Optuna Hyperparameter Optimization...")
     # Create study optimizing for the minimum difference
     study = optuna.create_study(direction="minimize")
-    study.optimize(lambda trial: objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, num_classes), n_trials=500)
+    study.optimize(lambda trial: objective(trial, train_dl, val_dl, device, input_dim_predictor, input_dim_adversary, num_classes), n_trials=100)
     
     best_alpha = study.best_params['alpha']
     print(f"\n--- Optimization Complete ---")
